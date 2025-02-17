@@ -6,14 +6,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"math"
 	"os"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
-
-	"hash/fnv"
 
 	"github.com/go-redis/redis/v8"
 )
@@ -156,126 +153,6 @@ func (t *RuleTrie) FindMatches(text string) map[string]struct{} {
 func (t *RuleTrie) getRule(ruleID string) (Rule, bool) {
 	rule, exists := t.rules[ruleID]
 	return rule, exists
-}
-
-// Optimized Trie implementation
-type CompressedTrieNode struct {
-	segment  string
-	children map[byte]*CompressedTrieNode
-	ruleIDs  map[string]struct{}
-}
-
-type OptimizedTrie struct {
-	root  *CompressedTrieNode
-	bloom *BloomFilter
-}
-
-func NewOptimizedTrie() *OptimizedTrie {
-	return &OptimizedTrie{
-		root: &CompressedTrieNode{
-			children: make(map[byte]*CompressedTrieNode),
-			ruleIDs:  make(map[string]struct{}),
-		},
-		bloom: NewBloomFilter(1000, 0.01), // Size and false positive rate
-	}
-}
-
-func (t *OptimizedTrie) Insert(word string, ruleID string) {
-	t.bloom.Add(word)
-	current := t.root
-	start := 0
-
-	for start < len(word) {
-		if len(current.children) == 0 {
-			// Compress remaining characters
-			node := &CompressedTrieNode{
-				segment:  word[start:],
-				children: make(map[byte]*CompressedTrieNode),
-				ruleIDs:  map[string]struct{}{ruleID: {}},
-			}
-			current.children[word[start]] = node
-			return
-		}
-
-		ch := word[start]
-		if next, exists := current.children[ch]; exists {
-			// Find common prefix
-			i := 0
-			for i < len(next.segment) && start+i < len(word) &&
-				word[start+i] == next.segment[i] {
-				i++
-			}
-
-			if i < len(next.segment) {
-				// Split node
-				newNode := &CompressedTrieNode{
-					segment:  next.segment[i:],
-					children: next.children,
-					ruleIDs:  next.ruleIDs,
-				}
-				next.segment = next.segment[:i]
-				next.children = map[byte]*CompressedTrieNode{}
-				next.children[newNode.segment[0]] = newNode
-			}
-
-			current = next
-			start += i
-		} else {
-			// Create new node
-			node := &CompressedTrieNode{
-				segment:  word[start:],
-				children: make(map[byte]*CompressedTrieNode),
-				ruleIDs:  map[string]struct{}{ruleID: {}},
-			}
-			current.children[ch] = node
-			return
-		}
-	}
-
-	current.ruleIDs[ruleID] = struct{}{}
-}
-
-// Bloom Filter implementation
-type BloomFilter struct {
-	bits []bool
-	k    int // Number of hash functions
-	m    int // Size of bit array
-}
-
-func NewBloomFilter(expectedItems int, falsePositiveRate float64) *BloomFilter {
-	// Calculate optimal size and number of hash functions
-	m := -int(float64(expectedItems) * math.Log(falsePositiveRate) / math.Pow(math.Log(2), 2))
-	k := int(float64(m) / float64(expectedItems) * math.Log(2))
-
-	return &BloomFilter{
-		bits: make([]bool, m),
-		k:    k,
-		m:    m,
-	}
-}
-
-func (bf *BloomFilter) hash(s string, i int) uint {
-	h := fnv.New64a()
-	h.Write([]byte(s))
-	h.Write([]byte{byte(i)})
-	return uint(h.Sum64()) % uint(bf.m)
-}
-
-func (bf *BloomFilter) Add(s string) {
-	for i := 0; i < bf.k; i++ {
-		pos := bf.hash(s, i)
-		bf.bits[pos] = true
-	}
-}
-
-func (bf *BloomFilter) MightContain(s string) bool {
-	for i := 0; i < bf.k; i++ {
-		pos := bf.hash(s, i)
-		if !bf.bits[pos] {
-			return false
-		}
-	}
-	return true
 }
 
 // Rule Engine
