@@ -19,17 +19,18 @@ import (
 
 // Models
 type Rule struct {
-	RuleID      string    `json:"rule_id"`
-	Level       string    `json:"level"`        // global/account
-	AuthID      string    `json:"auth_id"`      // account specific
-	MessageType string    `json:"message_type"` // sms/mms/all
-	Keyword     string    `json:"keyword"`
-	Source      string    `json:"source"`
-	Country     string    `json:"country"`     // country code for filtering
-	CampaignID  string    `json:"campaign_id"` // campaign specific filtering
-	Priority    int       `json:"priority"`
-	ConfigType  string    `json:"config_type"` // drop/review
-	CreatedAt   time.Time `json:"created_at"`
+	RuleID       string    `json:"rule_id"`
+	Level        string    `json:"level"`        // global/account
+	AuthID       string    `json:"auth_id"`      // account specific
+	MessageType  string    `json:"message_type"` // sms/mms/all
+	Keyword      string    `json:"keyword"`
+	IsStandalone bool      `json:"is_standalone"` // New field
+	Source       string    `json:"source"`
+	Country      string    `json:"country"`     // country code for filtering
+	CampaignID   string    `json:"campaign_id"` // campaign specific filtering
+	Priority     int       `json:"priority"`
+	ConfigType   string    `json:"config_type"` // drop/review
+	CreatedAt    time.Time `json:"created_at"`
 }
 
 type MessageContext struct {
@@ -56,12 +57,14 @@ func NewTrieNode() *TrieNode {
 }
 
 type RuleTrie struct {
-	root *TrieNode
+	root  *TrieNode
+	rules map[string]Rule // Reference to rules map
 }
 
-func NewRuleTrie() *RuleTrie {
+func NewRuleTrie(rules map[string]Rule) *RuleTrie {
 	return &RuleTrie{
-		root: NewTrieNode(),
+		root:  NewTrieNode(),
+		rules: rules,
 	}
 }
 
@@ -95,8 +98,10 @@ func (t *RuleTrie) FindMatches(text string) map[string]struct{} {
 	// Define punctuation characters to clean
 	punctuation := []string{".", ",", "?", "!", ":", ";", ")", "]", "}", "'", "\""}
 
-	// Split text into words and process each
+	// Split text into words for standalone matching
 	words := strings.Fields(text)
+
+	// For standalone matches - check each word exactly
 	for _, word := range words {
 		// Clean punctuation from end of word
 		cleanWord := word
@@ -104,22 +109,60 @@ func (t *RuleTrie) FindMatches(text string) map[string]struct{} {
 			cleanWord = strings.TrimSuffix(cleanWord, p)
 		}
 
-		// Check original word and cleaned word
-		for _, wordToCheck := range []string{word, cleanWord} {
-			node := t.root
-			for _, ch := range wordToCheck {
-				if next, exists := node.children[ch]; exists {
-					node = next
-					for ruleID := range node.ruleIDs {
-						matches[ruleID] = struct{}{}
-					}
-				} else {
-					break
+		// Check for exact word matches (standalone)
+		currentNode := t.root
+		for _, ch := range cleanWord {
+			if next, exists := currentNode.children[ch]; exists {
+				currentNode = next
+			} else {
+				break
+			}
+		}
+		// Check if we have any matches at this node
+		for ruleID := range currentNode.ruleIDs {
+			if rule, exists := t.getRule(ruleID); exists {
+				if rule.IsStandalone && strings.ToLower(rule.Keyword) == cleanWord {
+					matches[ruleID] = struct{}{}
 				}
 			}
 		}
 	}
+
+	// For non-standalone matches - check entire text
+	for i := 0; i < len(text); i++ {
+		currentNode := t.root // Start from root for each position
+		for j := i; j < len(text); j++ {
+			ch := rune(text[j])
+			if next, exists := currentNode.children[ch]; exists {
+				currentNode = next
+				// Check if any rules match at this point
+				for ruleID := range currentNode.ruleIDs {
+					if rule, exists := t.getRule(ruleID); exists {
+						if !rule.IsStandalone && strings.Contains(text, strings.ToLower(rule.Keyword)) {
+							matches[ruleID] = struct{}{}
+						}
+					}
+				}
+			} else {
+				break
+			}
+		}
+	}
+
 	return matches
+}
+
+// Add helper methods to RuleTrie
+func (t *RuleTrie) isStandaloneRule(ruleID string) bool {
+	if rule, exists := t.getRule(ruleID); exists {
+		return rule.IsStandalone
+	}
+	return false
+}
+
+func (t *RuleTrie) getRule(ruleID string) (Rule, bool) {
+	rule, exists := t.rules[ruleID]
+	return rule, exists
 }
 
 // Optimized Trie implementation
@@ -247,7 +290,6 @@ type RuleEngine struct {
 	redis       *redis.Client
 	keywordTrie *RuleTrie
 	rules       map[string]Rule
-	bloom       *BloomFilter
 	pubsub      *redis.PubSub
 	ctx         context.Context
 	cancel      context.CancelFunc
@@ -280,7 +322,6 @@ func (re *RuleEngine) LoadRulesFromCache(ctx context.Context) error {
 		// Add to trie if it has keyword
 		if rule.Keyword != "" {
 			re.keywordTrie.Insert(strings.ToLower(rule.Keyword), rule.RuleID)
-			re.bloom.Add(strings.ToLower(rule.Keyword))
 		}
 	}
 
@@ -303,8 +344,7 @@ func (re *RuleEngine) StartPeriodicSync() {
 
 				// Clear local state
 				re.rules = make(map[string]Rule)
-				re.keywordTrie = NewRuleTrie()
-				re.bloom = NewBloomFilter(1000, 0.01)
+				re.keywordTrie = NewRuleTrie(re.rules)
 
 				// Reload all rules
 				if err := re.LoadRulesFromCache(ctx); err != nil {
@@ -319,11 +359,11 @@ func (re *RuleEngine) StartPeriodicSync() {
 
 func NewRuleEngine(redisClient *redis.Client) *RuleEngine {
 	ctx, cancel := context.WithCancel(context.Background())
+	rules := make(map[string]Rule)
 	re := &RuleEngine{
 		redis:       redisClient,
-		keywordTrie: NewRuleTrie(),
-		rules:       make(map[string]Rule),
-		bloom:       NewBloomFilter(1000, 0.01),
+		keywordTrie: NewRuleTrie(rules),
+		rules:       rules,
 		pubsub:      redisClient.Subscribe(ctx, "rule-updates"),
 		ctx:         ctx,
 		cancel:      cancel,
@@ -344,15 +384,7 @@ func NewRuleEngine(redisClient *redis.Client) *RuleEngine {
 }
 
 func (re *RuleEngine) AddRule(rule Rule) error {
-	// Add keyword to bloom filter if it exists
-	if rule.Keyword != "" {
-		re.bloom.Add(strings.ToLower(rule.Keyword))
-	}
-
-	// Store rule
 	re.rules[rule.RuleID] = rule
-
-	// Add to trie if it has keyword
 	if rule.Keyword != "" {
 		re.keywordTrie.Insert(strings.ToLower(rule.Keyword), rule.RuleID)
 	}
@@ -490,7 +522,6 @@ func (re *RuleEngine) listenForUpdates() {
 				re.rules[update.Rule.RuleID] = update.Rule
 				if update.Rule.Keyword != "" {
 					re.keywordTrie.Insert(strings.ToLower(update.Rule.Keyword), update.Rule.RuleID)
-					re.bloom.Add(strings.ToLower(update.Rule.Keyword))
 				}
 				log.Printf("Added/Modified rule: %s", update.Rule.RuleID)
 
@@ -516,43 +547,17 @@ func (re *RuleEngine) EvaluateMessage(ctx context.Context, msgCtx *MessageContex
 	matchingRuleIDs := make(map[string]struct{})
 
 	if msgCtx.Content != "" {
-		content := strings.ToLower(msgCtx.Content)
-
-		// First check if any keywords might be in the message
-		hasKeyword := false
-		words := strings.Fields(content)
-
-		// Define punctuation characters to clean
-		punctuation := []string{".", ",", "?", "!", ":", ";", ")", "]", "}", "'", "\""}
-
-		for _, word := range words {
-			// Clean punctuation from end of word
-			cleanWord := word
-			for _, p := range punctuation {
-				cleanWord = strings.TrimSuffix(cleanWord, p)
-			}
-
-			// Check both original and cleaned word
-			if re.bloom.MightContain(word) || re.bloom.MightContain(cleanWord) {
-				hasKeyword = true
-				break
-			}
+		// Directly use Trie matching
+		matches := re.keywordTrie.FindMatches(msgCtx.Content)
+		for ruleID := range matches {
+			matchingRuleIDs[ruleID] = struct{}{}
 		}
 
-		// Only perform trie matching if bloom filter indicates possible matches
-		if hasKeyword {
-			matches := re.keywordTrie.FindMatches(content)
-			for ruleID := range matches {
-				matchingRuleIDs[ruleID] = struct{}{}
-			}
-		} else {
-			log.Printf("Message rejected early by bloom filter: no possible keyword matches")
-			// Check if there are any non-keyword based rules that might apply
-			for _, rule := range re.rules {
-				if rule.Keyword == "" && // No keyword
-					(rule.Level == "global" || rule.AuthID == msgCtx.AccountID) {
-					matchingRuleIDs[rule.RuleID] = struct{}{}
-				}
+		// Check for non-keyword based rules
+		for _, rule := range re.rules {
+			if rule.Keyword == "" && // No keyword
+				(rule.Level == "global" || rule.AuthID == msgCtx.AccountID) {
+				matchingRuleIDs[rule.RuleID] = struct{}{}
 			}
 		}
 	}
@@ -708,18 +713,24 @@ func main() {
 				configType, _ := reader.ReadString('\n')
 				configType = strings.TrimSpace(configType)
 
+				// Add standalone flag
+				fmt.Print("Is this a standalone keyword? (true/false): ")
+				isStandaloneStr, _ := reader.ReadString('\n')
+				isStandalone := strings.TrimSpace(isStandaloneStr) == "true"
+
 				rule := Rule{
-					RuleID:      ruleID,
-					Level:       level,
-					AuthID:      authID,
-					MessageType: messageType,
-					Keyword:     keyword,
-					Source:      source,
-					Country:     country,
-					CampaignID:  campaignID,
-					Priority:    priority,
-					ConfigType:  configType,
-					CreatedAt:   time.Now(),
+					RuleID:       ruleID,
+					Level:        level,
+					AuthID:       authID,
+					MessageType:  messageType,
+					Keyword:      keyword,
+					IsStandalone: isStandalone,
+					Source:       source,
+					Country:      country,
+					CampaignID:   campaignID,
+					Priority:     priority,
+					ConfigType:   configType,
+					CreatedAt:    time.Now(),
 				}
 
 				// Validate rule before adding
@@ -798,6 +809,7 @@ func main() {
 					fmt.Printf("  Account: %s\n", rule.AuthID)
 					fmt.Printf("  Message Type: %s\n", rule.MessageType)
 					fmt.Printf("  Keyword: %s\n", rule.Keyword)
+					fmt.Printf("  Is Standalone: %v\n", rule.IsStandalone)
 					fmt.Printf("  Source: %s\n", rule.Source)
 					fmt.Printf("  Country: %s\n", rule.Country)
 					fmt.Printf("  Campaign: %s\n", rule.CampaignID)
