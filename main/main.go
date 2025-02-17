@@ -8,6 +8,7 @@ import (
 	"log"
 	"math"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -536,66 +537,69 @@ func (re *RuleEngine) Close() {
 }
 
 func (re *RuleEngine) EvaluateMessage(ctx context.Context, msgCtx *MessageContext) (*Rule, error) {
-	matchingRuleIDs := make(map[string]struct{})
-
-	if msgCtx.Content != "" {
-		// Directly use Trie matching
-		matches := re.keywordTrie.FindMatches(msgCtx.Content)
-		for ruleID := range matches {
-			matchingRuleIDs[ruleID] = struct{}{}
-		}
-
-		// Check for non-keyword based rules
-		for _, rule := range re.rules {
-			if rule.Keyword == "" && // No keyword
-				(rule.Level == "global" || rule.AuthID == msgCtx.AccountID) {
-				matchingRuleIDs[rule.RuleID] = struct{}{}
-			}
-		}
-	}
-
-	// Process matching rules
-	var matchingRules []Rule
-	for ruleID := range matchingRuleIDs {
-		rule := re.rules[ruleID]
-
-		// Check if rule applies to this account
-		if rule.Level == "global" {
-			matchingRules = append(matchingRules, rule)
-			continue
-		}
-
-		// For account-level rules, check all conditions
-		if rule.AuthID == msgCtx.AccountID {
-			if rule.Country != "" && rule.Country != msgCtx.DestinationCountry {
-				continue
-			}
-			if rule.CampaignID != "" && rule.CampaignID != msgCtx.CampaignID {
-				continue
-			}
-			if rule.Source != "" && rule.Source != msgCtx.Source {
-				continue
-			}
-			if rule.MessageType != "all" && rule.MessageType != msgCtx.MessageType {
-				continue
-			}
-			matchingRules = append(matchingRules, rule)
-		}
-	}
-
-	if len(matchingRules) == 0 {
+	if msgCtx.Content == "" {
 		return nil, nil
 	}
 
-	// Return highest priority rule
-	bestRule := matchingRules[0]
-	for _, rule := range matchingRules[1:] {
-		if rule.Priority < bestRule.Priority {
-			bestRule = rule
+	// Get keyword matches from trie
+	matches := re.keywordTrie.FindMatches(msgCtx.Content)
+
+	// First check global rules (priority 0)
+	for ruleID := range matches {
+		rule := re.rules[ruleID]
+		if rule.Level == "global" {
+			return &rule, nil
 		}
 	}
 
-	return &bestRule, nil
+	// Check non-keyword global rules
+	for _, rule := range re.rules {
+		if rule.Level == "global" && rule.Keyword == "" {
+			return &rule, nil
+		}
+	}
+
+	// For account-level rules, sort by priority and check each
+	var accountRules []Rule
+	for ruleID := range matches {
+		rule := re.rules[ruleID]
+		if rule.Level == "account" && rule.AuthID == msgCtx.AccountID {
+			accountRules = append(accountRules, rule)
+		}
+	}
+
+	// Add non-keyword account rules
+	for _, rule := range re.rules {
+		if rule.Level == "account" && rule.Keyword == "" && rule.AuthID == msgCtx.AccountID {
+			accountRules = append(accountRules, rule)
+		}
+	}
+
+	// Sort account rules by priority
+	sort.Slice(accountRules, func(i, j int) bool {
+		return accountRules[i].Priority < accountRules[j].Priority
+	})
+
+	// Check account rules in priority order
+	for _, rule := range accountRules {
+		// Check all conditions
+		if rule.Country != "" && rule.Country != msgCtx.DestinationCountry {
+			continue
+		}
+		if rule.CampaignID != "" && rule.CampaignID != msgCtx.CampaignID {
+			continue
+		}
+		if rule.Source != "" && rule.Source != msgCtx.Source {
+			continue
+		}
+		if rule.MessageType != "all" && rule.MessageType != msgCtx.MessageType {
+			continue
+		}
+		// Found a matching rule, return immediately
+		return &rule, nil
+	}
+
+	return nil, nil
 }
 
 func main() {
