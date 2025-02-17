@@ -152,14 +152,6 @@ func (t *RuleTrie) FindMatches(text string) map[string]struct{} {
 	return matches
 }
 
-// Add helper methods to RuleTrie
-func (t *RuleTrie) isStandaloneRule(ruleID string) bool {
-	if rule, exists := t.getRule(ruleID); exists {
-		return rule.IsStandalone
-	}
-	return false
-}
-
 func (t *RuleTrie) getRule(ruleID string) (Rule, bool) {
 	rule, exists := t.rules[ruleID]
 	return rule, exists
